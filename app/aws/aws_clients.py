@@ -14,3 +14,4 @@ AWS_CLIENT_CONFIG = Config(
 
 s3 = boto3.client("s3", region_name=AWS_REGION, config=AWS_CLIENT_CONFIG)
 sqs = boto3.client("sqs", region_name=AWS_REGION, config=AWS_CLIENT_CONFIG)
+sns = boto3.client("sns", region_name=AWS_REGION, config=AWS_CLIENT_CONFIG)

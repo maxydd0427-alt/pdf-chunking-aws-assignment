@@ -4,6 +4,7 @@ Configuration for the decoupled AWS version.
 Expected environment variables:
     AWS_REGION
     S3_BUCKET_NAME
+    SNS_TOPIC_ARN
     FIXED_SIZE_QUEUE_URL
     PARAGRAPH_AWARE_QUEUE_URL
     DATABASE_URL
@@ -19,6 +20,7 @@ import os
 
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
+SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN", "")
 FIXED_SIZE_QUEUE_URL = os.getenv("FIXED_SIZE_QUEUE_URL", "")
 PARAGRAPH_AWARE_QUEUE_URL = os.getenv("PARAGRAPH_AWARE_QUEUE_URL", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -54,6 +56,7 @@ def require_web_config() -> None:
         name
         for name, value in {
             "S3_BUCKET_NAME": S3_BUCKET_NAME,
+            "SNS_TOPIC_ARN": SNS_TOPIC_ARN,
             "DATABASE_URL": DATABASE_URL,
         }.items()
         if not value
