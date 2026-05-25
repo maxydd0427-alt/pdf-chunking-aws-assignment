@@ -1,1 +1,8 @@
 .DS_Store
+
+# SSH private keys / AWS key pairs
+*.pem
+*.pem.pem
+
+# Local shell/history files
+.Rhistory
