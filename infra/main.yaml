@@ -406,6 +406,7 @@ Resources:
 
   UploadBucket:
     Type: AWS::S3::Bucket
+    DependsOn: ProcessingTopicPolicy
     Properties:
       BucketName:
         Fn::Sub: "${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads"
@@ -414,6 +415,11 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Topic:
+              Ref: ProcessingTopic
       Tags:
         - Key: Name
           Value:
@@ -428,6 +434,29 @@ Resources:
     Properties:
       TopicName:
         Fn::Sub: "${ProjectName}-processing-topic"
+
+  ProcessingTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - Ref: ProcessingTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3ToPublishUploadEvents
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource:
+              Ref: ProcessingTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnLike:
+                AWS:SourceArn:
+                  Fn::Sub: "arn:aws:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads"
 
   FixedSizeQueue:
     Type: AWS::SQS::Queue
