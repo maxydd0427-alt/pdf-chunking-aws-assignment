@@ -16,7 +16,6 @@ Run workers separately:
 
 from __future__ import annotations
 
-import json
 import time
 from typing import Any
 from uuid import uuid4
@@ -25,11 +24,10 @@ from flask import Flask, redirect, render_template_string, request, url_for
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
-from aws_clients import s3, sns
+from aws_clients import s3
 from config import (
     MAX_FILE_SIZE_MB,
     S3_BUCKET_NAME,
-    SNS_TOPIC_ARN,
     STRATEGIES,
     require_web_config,
 )
@@ -200,21 +198,6 @@ def upload():
                 s3_key=s3_key,
                 filename=original_filename,
             )
-
-    s3_event_message = {
-        "Records": [
-            {
-                "s3": {
-                    "bucket": {"name": S3_BUCKET_NAME},
-                    "object": {"key": s3_key},
-                }
-            }
-        ]
-    }
-    sns.publish(
-        TopicArn=SNS_TOPIC_ARN,
-        Message=json.dumps(s3_event_message),
-    )
 
     return redirect(url_for("document_detail", document_id=document_id))
 
