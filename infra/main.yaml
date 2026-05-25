@@ -1,0 +1,874 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  COMP5349 Assignment 2 - Event-driven PDF chunking application
+  using ALB, Auto Scaling Group, S3, RDS, SNS, SQS, and EC2 worker tier.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: pdf-chunking
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access if needed
+    Default: pdf-chunking-key
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t3.micro
+      - t2.micro
+
+  DBName:
+    Type: String
+    Default: appdb
+
+  DBUsername:
+    Type: String
+    Default: appuser
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Resources:
+
+  ########################################
+  # VPC
+  ########################################
+
+  AppVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-igw"
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      InternetGatewayId:
+        Ref: InternetGateway
+
+  ########################################
+  # Subnets
+  ########################################
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-public-a"
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-public-b"
+
+  PrivateAppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      CidrBlock: 10.0.11.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-private-app-a"
+
+  PrivateAppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      CidrBlock: 10.0.12.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-private-app-b"
+
+  PrivateDBSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      CidrBlock: 10.0.21.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-private-db-a"
+
+  PrivateDBSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      CidrBlock: 10.0.22.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-private-db-b"
+
+  ########################################
+  # Public Route Table
+  ########################################
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-public-rt"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnetA
+      RouteTableId:
+        Ref: PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PublicSubnetB
+      RouteTableId:
+        Ref: PublicRouteTable
+
+  ########################################
+  # NAT Gateway and Private Route Table
+  ########################################
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-nat-eip"
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+          - NatEIP
+          - AllocationId
+      SubnetId:
+        Ref: PublicSubnetA
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-nat"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-private-rt"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: NatGateway
+
+  PrivateAppSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateAppSubnetA
+      RouteTableId:
+        Ref: PrivateRouteTable
+
+
+  PrivateAppSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateAppSubnetB
+      RouteTableId:
+        Ref: PrivateRouteTable
+
+
+  ########################################
+  # Database Route Table
+  ########################################
+
+  DBRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: AppVPC
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-db-rt"
+
+  PrivateDBSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateDBSubnetA
+      RouteTableId:
+        Ref: DBRouteTable
+
+  PrivateDBSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId:
+        Ref: PrivateDBSubnetB
+      RouteTableId:
+        Ref: DBRouteTable
+
+ 
+
+  ########################################
+  # Security Groups
+  ########################################
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP traffic from internet to ALB
+      VpcId:
+        Ref: AppVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-alb-sg"
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow web traffic only from ALB
+      VpcId:
+        Ref: AppVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId:
+            Ref: ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-web-sg"
+
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Worker instances use outbound access only
+      VpcId:
+        Ref: AppVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-worker-sg"
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow PostgreSQL access only from web and worker tiers
+      VpcId:
+        Ref: AppVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId:
+            Ref: WebSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId:
+            Ref: WorkerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-rds-sg"
+
+  ########################################
+  # S3 Bucket
+  ########################################
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: "${ProjectName}-${AWS::AccountId}-${AWS::Region}-uploads"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-uploads"
+
+  ########################################
+  # SNS and SQS
+  ########################################
+
+  ProcessingTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:
+        Fn::Sub: "${ProjectName}-processing-topic"
+
+  FixedSizeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:
+        Fn::Sub: "${ProjectName}-fixed-size-queue"
+      VisibilityTimeout: 300
+
+  ParagraphAwareQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:
+        Fn::Sub: "${ProjectName}-paragraph-aware-queue"
+      VisibilityTimeout: 300
+
+  FixedSizeQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: FixedSizeQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource:
+              Fn::GetAtt:
+                - FixedSizeQueue
+                - Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  Ref: ProcessingTopic
+
+  ParagraphAwareQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - Ref: ParagraphAwareQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource:
+              Fn::GetAtt:
+                - ParagraphAwareQueue
+                - Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  Ref: ProcessingTopic
+
+  FixedSizeSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn:
+        Ref: ProcessingTopic
+      Protocol: sqs
+      Endpoint:
+        Fn::GetAtt:
+          - FixedSizeQueue
+          - Arn
+
+  ParagraphAwareSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn:
+        Ref: ProcessingTopic
+      Protocol: sqs
+      Endpoint:
+        Fn::GetAtt:
+          - ParagraphAwareQueue
+          - Arn
+
+  ########################################
+  # RDS PostgreSQL
+  ########################################
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private DB subnet group for application database
+      SubnetIds:
+        - Ref: PrivateDBSubnetA
+        - Ref: PrivateDBSubnetB
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-db-subnet-group"
+
+  AppDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier:
+        Fn::Sub: "${ProjectName}-db"
+      Engine: postgres
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      DBName:
+        Ref: DBName
+      MasterUsername:
+        Ref: DBUsername
+      MasterUserPassword:
+        Ref: DBPassword
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - Ref: RDSSecurityGroup
+      DBSubnetGroupName:
+        Ref: DBSubnetGroup
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+      MultiAZ: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-rds"
+
+  ########################################
+  # IAM Roles for Web and Worker EC2
+  ########################################
+
+  WebEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: "${ProjectName}-web-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName:
+            Fn::Sub: "${ProjectName}-web-access-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WebS3UploadAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - Fn::GetAtt:
+                      - UploadBucket
+                      - Arn
+                  - Fn::Sub: "${UploadBucket.Arn}/*"
+
+              - Sid: WebSNSPublishAccess
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  Ref: ProcessingTopic
+
+  WebEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName:
+        Fn::Sub: "${ProjectName}-web-ec2-instance-profile"
+      Roles:
+        - Ref: WebEC2Role
+
+  WorkerEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: "${ProjectName}-worker-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName:
+            Fn::Sub: "${ProjectName}-worker-access-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WorkerS3ReadAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - Fn::GetAtt:
+                      - UploadBucket
+                      - Arn
+                  - Fn::Sub: "${UploadBucket.Arn}/*"
+
+              - Sid: WorkerSQSConsumeAccess
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                Resource:
+                  - Fn::GetAtt:
+                      - FixedSizeQueue
+                      - Arn
+                  - Fn::GetAtt:
+                      - ParagraphAwareQueue
+                      - Arn
+
+  WorkerEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName:
+        Fn::Sub: "${ProjectName}-worker-ec2-instance-profile"
+      Roles:
+        - Ref: WorkerEC2Role
+
+  ########################################
+  # Application Load Balancer
+  ########################################
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name:
+        Fn::Sub: "${ProjectName}-alb"
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - Ref: ALBSecurityGroup
+      Subnets:
+        - Ref: PublicSubnetA
+        - Ref: PublicSubnetB
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-alb"
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name:
+        Fn::Sub: "${ProjectName}-tg"
+      VpcId:
+        Ref: AppVPC
+      Protocol: HTTP
+      Port: 5000
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "5000"
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: "200-399"
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-web-tg"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn:
+        Ref: ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: WebTargetGroup
+
+  ########################################
+  # Web Launch Template and Auto Scaling Group
+  ########################################
+
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName:
+        Fn::Sub: "${ProjectName}-web-lt"
+      LaunchTemplateData:
+        ImageId:
+          Ref: LatestAmiId
+        InstanceType:
+          Ref: InstanceType
+        KeyName:
+          Ref: KeyName
+        IamInstanceProfile:
+          Arn:
+            Fn::GetAtt:
+              - WebEC2InstanceProfile
+              - Arn
+        SecurityGroupIds:
+          - Ref: WebSecurityGroup
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              dnf update -y
+              dnf install -y python3 python3-pip git
+
+              mkdir -p /opt/pdf-chunking-app
+
+              cat <<EOF >> /etc/environment
+              S3_BUCKET_NAME=${UploadBucket}
+              SNS_TOPIC_ARN=${ProcessingTopic}
+              FIXED_SIZE_QUEUE_URL=${FixedSizeQueue}
+              PARAGRAPH_AWARE_QUEUE_URL=${ParagraphAwareQueue}
+              DATABASE_URL=postgresql://${DBUsername}:${DBPassword}@${AppDatabase.Endpoint.Address}:5432/${DBName}
+              AWS_DEFAULT_REGION=${AWS::Region}
+              EOF
+
+              cd /opt/pdf-chunking-app
+              git clone https://github.com/xxx/pdf-chunking-aws-assignment.git .
+              cd aws
+              pip3 install -r requirements.txt
+              nohup python3 app.py > web.log 2>&1 &
+
+  WebAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName:
+        Fn::Sub: "${ProjectName}-web-asg"
+      VPCZoneIdentifier:
+        - Ref: PrivateAppSubnetA
+        - Ref: PrivateAppSubnetB
+      MinSize: "1"
+      MaxSize: "2"
+      DesiredCapacity: "1"
+      TargetGroupARNs:
+        - Ref: WebTargetGroup
+      LaunchTemplate:
+        LaunchTemplateId:
+          Ref: WebLaunchTemplate
+        Version:
+          Fn::GetAtt:
+            - WebLaunchTemplate
+            - LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-web-asg-instance"
+          PropagateAtLaunch: true
+
+  ########################################
+  # Worker EC2 Instance
+  ########################################
+
+  WorkerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId:
+        Ref: LatestAmiId
+      InstanceType:
+        Ref: InstanceType
+      KeyName:
+        Ref: KeyName
+      IamInstanceProfile:
+        Ref: WorkerEC2InstanceProfile
+      SubnetId:
+        Ref: PrivateAppSubnetA
+      SecurityGroupIds:
+        - Ref: WorkerSecurityGroup
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: "${ProjectName}-worker"
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            dnf update -y
+            dnf install -y python3 python3-pip git
+
+            mkdir -p /opt/pdf-chunking-app
+
+            cat <<EOF >> /etc/environment
+            S3_BUCKET_NAME=${UploadBucket}
+            FIXED_SIZE_QUEUE_URL=${FixedSizeQueue}
+            PARAGRAPH_AWARE_QUEUE_URL=${ParagraphAwareQueue}
+            DATABASE_URL=postgresql://${DBUsername}:${DBPassword}@${AppDatabase.Endpoint.Address}:5432/${DBName}
+            AWS_DEFAULT_REGION=${AWS::Region}
+            EOF
+
+            # TODO:
+            # 1. Copy or clone your aws application code into /opt/pdf-chunking-app
+            # 2. Run: pip3 install -r requirements.txt
+            # 3. Start fixed-size worker process
+            # 4. Start paragraph-aware worker process
+            # Example only:
+            # cd /opt/pdf-chunking-app
+            # nohup python3 fixed_size_worker.py > fixed_worker.log 2>&1 &
+            # nohup python3 paragraph_aware_worker.py > paragraph_worker.log 2>&1 &
+
+Outputs:
+
+  VPCId:
+    Description: VPC ID
+    Value:
+      Ref: AppVPC
+
+  LoadBalancerDNSName:
+    Description: Public DNS name of the Application Load Balancer
+    Value:
+      Fn::GetAtt:
+        - ApplicationLoadBalancer
+        - DNSName
+
+  LoadBalancerURL:
+    Description: Public URL of the web application
+    Value:
+      Fn::Sub:
+        - "http://${ALBDNS}"
+        - ALBDNS:
+            Fn::GetAtt:
+              - ApplicationLoadBalancer
+              - DNSName
+
+  S3BucketName:
+    Description: S3 bucket for uploaded PDF files
+    Value:
+      Ref: UploadBucket
+
+  DatabaseEndpoint:
+    Description: RDS database endpoint
+    Value:
+      Fn::GetAtt:
+        - AppDatabase
+        - Endpoint.Address
+
+  SNSTopicArn:
+    Description: SNS topic ARN for processing events
+    Value:
+      Ref: ProcessingTopic
+
+  FixedSizeQueueUrl:
+    Description: SQS queue URL for fixed-size chunking worker
+    Value:
+      Ref: FixedSizeQueue
+
+  ParagraphAwareQueueUrl:
+    Description: SQS queue URL for paragraph-aware chunking worker
+    Value:
+      Ref: ParagraphAwareQueue
+
+  WorkerInstanceId:
+    Description: Worker EC2 instance ID
+    Value:
+      Ref: WorkerInstance
