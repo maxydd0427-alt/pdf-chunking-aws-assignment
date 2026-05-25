@@ -797,7 +797,7 @@ Resources:
   # Worker EC2 Instance
   ########################################
 
-  WorkerInstance:
+  WorkerInstanceV2:
     Type: AWS::EC2::Instance
     Properties:
       ImageId:
@@ -911,4 +911,4 @@ Outputs:
   WorkerInstanceId:
     Description: Worker EC2 instance ID
     Value:
-      Ref: WorkerInstance
+      Ref: WorkerInstanceV2
