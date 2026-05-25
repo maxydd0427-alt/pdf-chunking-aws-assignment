@@ -9,6 +9,16 @@ Parameters:
     Type: String
     Default: pdf-chunking
 
+  AppGitRepoUrl:
+    Type: String
+    Description: GitHub repository URL that contains the app/aws source code
+    Default: https://github.com/maxydd0427-alt/pdf-chunking-aws-assignment.git
+
+  AppGitBranch:
+    Type: String
+    Description: Git branch to deploy from
+    Default: main
+
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: EC2 key pair for SSH access if needed
@@ -721,25 +731,41 @@ Resources:
           Fn::Base64:
             Fn::Sub: |
               #!/bin/bash
+              set -euxo pipefail
+
               dnf update -y
-              dnf install -y python3 python3-pip git
+              dnf install -y python3 python3-pip git postgresql15
 
-              mkdir -p /opt/pdf-chunking-app
+              APP_ROOT=/opt/pdf-chunking-app
+              APP_DIR=$APP_ROOT/app/aws
+              LOG_DIR=/var/log/pdf-chunking-app
 
-              cat <<EOF >> /etc/environment
-              S3_BUCKET_NAME=${UploadBucket}
-              SNS_TOPIC_ARN=${ProcessingTopic}
-              FIXED_SIZE_QUEUE_URL=${FixedSizeQueue}
-              PARAGRAPH_AWARE_QUEUE_URL=${ParagraphAwareQueue}
-              DATABASE_URL=postgresql://${DBUsername}:${DBPassword}@${AppDatabase.Endpoint.Address}:5432/${DBName}
-              AWS_DEFAULT_REGION=${AWS::Region}
+              mkdir -p $APP_ROOT
+              mkdir -p $LOG_DIR
+
+              cat > /etc/profile.d/pdf-chunking-env.sh <<EOF
+              export S3_BUCKET_NAME=${UploadBucket}
+              export SNS_TOPIC_ARN=${ProcessingTopic}
+              export FIXED_SIZE_QUEUE_URL=${FixedSizeQueue}
+              export PARAGRAPH_AWARE_QUEUE_URL=${ParagraphAwareQueue}
+              export DATABASE_URL=postgresql://${DBUsername}:${DBPassword}@${AppDatabase.Endpoint.Address}:5432/${DBName}
+              export AWS_DEFAULT_REGION=${AWS::Region}
               EOF
 
-              cd /opt/pdf-chunking-app
-              git clone https://github.com/xxx/pdf-chunking-aws-assignment.git .
-              cd aws
-              pip3 install -r requirements.txt
-              nohup python3 app.py > web.log 2>&1 &
+              chmod 644 /etc/profile.d/pdf-chunking-env.sh
+              source /etc/profile.d/pdf-chunking-env.sh
+
+              rm -rf $APP_ROOT/*
+              git clone --branch ${AppGitBranch} ${AppGitRepoUrl} $APP_ROOT
+
+              cd $APP_DIR
+              python3 -m pip install -r requirements.txt
+
+              if [ -f schema.sql ]; then
+                psql "$DATABASE_URL" -f schema.sql || true
+              fi
+
+              nohup python3 app.py > $LOG_DIR/web.log 2>&1 &
 
   WebAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -794,28 +820,42 @@ Resources:
         Fn::Base64:
           Fn::Sub: |
             #!/bin/bash
+            set -euxo pipefail
+
             dnf update -y
-            dnf install -y python3 python3-pip git
+            dnf install -y python3 python3-pip git postgresql15
 
-            mkdir -p /opt/pdf-chunking-app
+            APP_ROOT=/opt/pdf-chunking-app
+            APP_DIR=$APP_ROOT/app/aws
+            LOG_DIR=/var/log/pdf-chunking-app
 
-            cat <<EOF >> /etc/environment
-            S3_BUCKET_NAME=${UploadBucket}
-            FIXED_SIZE_QUEUE_URL=${FixedSizeQueue}
-            PARAGRAPH_AWARE_QUEUE_URL=${ParagraphAwareQueue}
-            DATABASE_URL=postgresql://${DBUsername}:${DBPassword}@${AppDatabase.Endpoint.Address}:5432/${DBName}
-            AWS_DEFAULT_REGION=${AWS::Region}
+            mkdir -p $APP_ROOT
+            mkdir -p $LOG_DIR
+
+            cat > /etc/profile.d/pdf-chunking-env.sh <<EOF
+            export S3_BUCKET_NAME=${UploadBucket}
+            export FIXED_SIZE_QUEUE_URL=${FixedSizeQueue}
+            export PARAGRAPH_AWARE_QUEUE_URL=${ParagraphAwareQueue}
+            export DATABASE_URL=postgresql://${DBUsername}:${DBPassword}@${AppDatabase.Endpoint.Address}:5432/${DBName}
+            export AWS_DEFAULT_REGION=${AWS::Region}
             EOF
 
-            # TODO:
-            # 1. Copy or clone your aws application code into /opt/pdf-chunking-app
-            # 2. Run: pip3 install -r requirements.txt
-            # 3. Start fixed-size worker process
-            # 4. Start paragraph-aware worker process
-            # Example only:
-            # cd /opt/pdf-chunking-app
-            # nohup python3 fixed_size_worker.py > fixed_worker.log 2>&1 &
-            # nohup python3 paragraph_aware_worker.py > paragraph_worker.log 2>&1 &
+            chmod 644 /etc/profile.d/pdf-chunking-env.sh
+            source /etc/profile.d/pdf-chunking-env.sh
+
+            rm -rf $APP_ROOT/*
+            git clone --branch ${AppGitBranch} ${AppGitRepoUrl} $APP_ROOT
+
+            cd $APP_DIR
+            
+            python3 -m pip install -r requirements.txt
+
+            if [ -f schema.sql ]; then
+              psql "$DATABASE_URL" -f schema.sql || true
+            fi
+
+            nohup python3 worker_fixed_size.py > $LOG_DIR/worker_fixed_size.log 2>&1 &
+            nohup python3 worker_paragraph_aware.py > $LOG_DIR/worker_paragraph_aware.log 2>&1 &
 
 Outputs:
 
